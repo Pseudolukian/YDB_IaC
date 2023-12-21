@@ -1,5 +1,5 @@
 #======== Auth setup zone ===========#
-key_path = "../../auth_key.json"                    // Set the JSON SA key file
+key_path = "../auth_key.json"                    // Set the JSON SA key file
 cloud_id = "b1gv7kfcttiop2s874m6"                   // Yandex WEB GUI Cloud 
 folder_id = "b1gd9ii2bbihondqoibt"                  // Yandex folder ID
 zone_name = "ru-central1-a"                         // Yandex zone name
