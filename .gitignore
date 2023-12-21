@@ -1,3 +1,4 @@
 .terraform
 .DS_Store
 .gitignore
+./YandexCloud/auth_key.json
