@@ -1,0 +1,201 @@
+- hosts: ydb-server
+  become: true
+  gather_facts: yes
+
+  tasks:
+#================== Collecting disk information ==================#
+  - name: List disk IDs matching 'virtio-ydb-disk-'
+    ansible.builtin.shell: ls -l /dev/disk/by-id/ | grep 'virtio-ydb-disk-' | awk '{print $9}'
+    register: disk_info
+
+  - name: Count disks matching 'virtio-ydb-disk-'
+    ansible.builtin.shell: ls -l /dev/disk/by-id/ | grep 'virtio-ydb-disk-' | awk '{print $9}' | wc -l
+    register: disk_value  
+
+#================== Collecting CPU information ==================#
+  - name: Get number of CPU cores
+    ansible.builtin.shell: lscpu | grep '^CPU(s):' | awk '{print $2}'
+    register: cpu_cores_info
+
+#================== Collecting hostname information ==================#
+  - name: Get the hostname
+    ansible.builtin.command: hostname
+    register: hostname
+
+  
+#================== Preparing YDB folder structure ==================#
+  - name: Create the ydb group
+    group: name=ydb system=true
+
+  - name: Create the ydb user with disk group access
+    user: 
+      name: ydb
+      group: ydb 
+      groups: disk 
+      system: true 
+      create_home: true 
+      home: "{{ ydb_dir }}/home"
+      comment: "YDB Service Account"
+
+  - name: Create the Ansible remote_tmp for the ydb user
+    file:
+      path: "{{ ydb_dir }}/home/.ansible/tmp"
+      state: directory
+      recurse: true
+      group: ydb
+      owner: ydb
+
+#================== Creating YDB directories ==================#
+
+  - name: Create the YDB release directory
+    file: state=directory path={{ ydb_dir }}/release group=bin owner=root mode=755
+
+  - name: Create the YDB configuration directory
+    file: state=directory path={{ ydb_dir }}/cfg group=ydb owner=ydb mode=755
+
+  - name: Create the YDB audit directory
+    file: state=directory path={{ ydb_dir }}/audit group=ydb owner=ydb mode=700
+
+  - name: Create the YDB certs directory
+    file: state=directory path={{ ydb_dir }}/certs group=ydb owner=ydb mode=700
+
+  - name: Create the YDB configuration backup directory
+    file: state=directory path={{ ydb_dir }}/reserve group=ydb owner=ydb mode=700
+
+  - name: Create the YDB server binary directory for the specified version
+    file: state=directory
+          path="{{ ydb_dir }}/release/{{ ydb_version }}"
+          recurse=true
+          group=bin
+          owner=root
+
+#================== Downloading and installing YDB ==================#
+
+  - name: Download the YDB sources archive
+    get_url: url={{ ydb_download_url }} dest={{ ydb_dir }}/release/{{ ydb_version }}/{{ ydb_archive }}
+
+  - name: Set owner and group for the YDB sources archive
+    file: 
+          path="{{ ydb_dir }}/release/{{ ydb_version }}/{{ ydb_archive }}"
+          group=bin
+          owner=root  
+
+  - name: Install the YDB server binary package
+    ansible.builtin.unarchive:
+      remote_src: yes
+      creates: "{{ ydb_dir }}/release/{{ ydb_version }}/bin/ydbd"
+      dest: "{{ ydb_dir }}/release/{{ ydb_version }}"
+      group: bin
+      owner: root
+      src: "{{ ydb_dir }}/release/{{ ydb_version }}/{{ ydb_archive }}"
+      extra_opts: "{{ ydb_unpack_options }}"
+  
+  - name: Create the YDB CLI default binary directory
+    file: state=directory path={{ ydb_dir }}/home/ydb/bin recurse=true group=ydb owner=ydb mode=700
+
+
+#============ Generating YDB configuration files ===================#
+  - name: Generate YDB static configuration file from template
+    ansible.builtin.template:
+      src: ./files/static_config.j2 
+      dest: "{{ ydb_dir }}/cfg/static_config.yaml"
+    vars:
+      disk_info: "{{ disk_info }}"
+  
+  - name: Generate YDB dynamic configuration file from template
+    ansible.builtin.template:
+      src: ./files/dynamic_config.j2 
+      dest: "{{ ydb_dir }}/cfg/dynamic_config.yaml"
+    vars:
+      disk_info: "{{ disk_info }}" 
+
+#============ Generating YDB services and starting up the storage service =========#
+  - name: Generate the YDB static node service file from template
+    template:
+      src: ./files/static-service.j2
+      dest: "/etc/systemd/system/ydbd-storage.service"    
+  
+  - name: Generate the YDB dynamic node service file from template
+    template:
+      src: ./files/dynnode-service.j2
+      dest: "/etc/systemd/system/ydbd-dynnode.service" 
+
+  - name: Refresh systemd configuration to recognize new services
+    ansible.builtin.systemd:
+      daemon_reload: true
+
+  - name: Start the YDB storage node service
+    become: true
+    ansible.builtin.systemd:
+      state: started
+      name: ydbd-storage
+    any_errors_fatal: true    
+
+  - name: Verify that the YDB storage node service is active
+    shell: systemctl is-active ydbd-storage || true
+    register: ydbd_storage_status
+    any_errors_fatal: true
+    retries: 5
+    delay: 10
+    until: ydbd_storage_status.stdout == "active"
+
+#============ Creating database and starting database processes =======#
+  - name: Initialize storage if YDB storage node is active and not already done
+    shell: >
+      if grep -q 'initialize_storage_done' {{ ydb_dir }}/ydb_init_status; then
+        echo 'Initialize storage already done';
+      else
+        {{ ydb_dir }}/release/{{ ydb_version }}/bin/ydbd -s grpc://{{ inner_net }}:{{ grpc_port }} admin blobstorage config init --yaml-file {{ ydb_dir }}/cfg/static_config.yaml &&
+        echo 'initialize_storage_done' >> {{ ydb_dir }}/ydb_init_status;
+      fi
+    environment:
+      LD_LIBRARY_PATH: "{{ ydb_dir }}/release/{{ ydb_version }}/lib"
+    when: ydbd_storage_status.stdout == "active"
+
+  - name: Register database if YDB storage node is active and not already done
+    shell: >
+      if grep -q 'register_database_done' {{ ydb_dir }}/ydb_init_status; then
+        echo 'Register database already done';
+      else
+        {{ ydb_dir }}/release/{{ ydb_version }}/bin/ydbd -s grpc://{{ inner_net }}:{{ grpc_port }} admin database /{{ ydb_domain }}/{{ ydb_dbname }} create ssd:{{ disk_value.stdout }} &&
+        echo 'register_database_done' >> {{ ydb_dir }}/ydb_init_status;
+      fi
+    environment:
+      LD_LIBRARY_PATH: "{{ ydb_dir }}/release/{{ ydb_version }}/lib"
+    when: ydbd_storage_status.stdout == "active"
+
+
+  - name: Start database processes if YDB storage node is active
+    become: true
+    ansible.builtin.systemd:
+      state: started
+      name: "ydbd-dynnode"    
+    any_errors_fatal: true 
+    retries: 5
+    delay: 10
+    when: ydbd_storage_status.stdout == "active"
+
+
+#============= Establish SSH tunnel and display connection URL ==========#
+  - name: Get list of available shells from /etc/shells
+    delegate_to: localhost
+    become: false
+    ansible.builtin.command: cat /etc/shells
+    register: shell_output
+
+  - name: Set active shell to bash or zsh if available
+    set_fact:
+      active_shell: "{{ '/bin/bash' if '/bin/bash' in shell_output.stdout else '/bin/zsh' if '/bin/zsh' in shell_output.stdout else omit }}"
+
+  - name: Establish an SSH tunnel to the YDB monitoring port
+    delegate_to: localhost
+    become: false
+    ansible.builtin.shell: 
+      cmd: "ssh  -f -L {{ mon_port }}:localhost:{{ mon_port }} -N -i {{ ansible_ssh_private_key_file }} -vvv {{ ansible_ssh_user }}@{{ inventory_hostname }}"
+      executable: "{{ active_shell }}"
+    async: 15
+    poll: 0
+  
+  - name: Display the YDB monitoring connection URL
+    ansible.builtin.debug:
+      msg: "Now you can connect to YDB monitoring via this URL: http://localhost:{{ mon_port }}"

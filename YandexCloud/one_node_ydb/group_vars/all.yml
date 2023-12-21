@@ -1,0 +1,21 @@
+#===== Conf. settings for all YDB cluster nodes =======#
+ansible_python_interpreter: /usr/bin/python3           # Path to Python interpreter
+ydb_unpack_options: "--strip-component=1"              # Options for unpacking YDB
+
+#============== YDB software version setup ============#
+ydb_version: 23.3.13                                   # YDB server software release version
+ydb_archive: ydbd-{{ ydb_version }}-linux-amd64.tar.gz # YDB server software archive name
+ydb_download_url: https://binaries.ydb.tech/release/{{ ydb_version }}/{{ ydb_archive }} # URL for downloading YDB software
+
+#========== YDB installation directories setup ========#
+ydb_dir: /opt/ydb                                      # Directory for YDB software installation
+
+#================== Base setup ========================#
+ydb_domain: Root                                       # YDB cluster domain (aka cluster identifier), 'Root' as per documentation
+ydb_dbname: testdb                                     # Database name for the dynamic nodes
+
+#================ Network setup =======================#
+grpc_port: 2135                                        # gRPC port for YDB static node (storage). For dynamic YDB node, using gRPC port +1.
+ic_port: 19001                                         # Internal communication port for YDB static node (storage). For dynamic YDB node, using IC port +1.
+mon_port: 8765                                         # Monitoring port for YDB static node (storage). For dynamic YDB node, using monitoring port +1.
+inner_net: 127.0.0.1                                   # Internal network address
